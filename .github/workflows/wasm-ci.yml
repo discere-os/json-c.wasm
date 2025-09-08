@@ -1,0 +1,211 @@
+name: JSON-C WASM CI
+
+on:
+  push:
+    branches: [wasm]
+  pull_request:
+    branches: [wasm]
+  release:
+    types: [created]
+
+env:
+  EMSCRIPTEN_VERSION: '4.0.13'
+  NODE_VERSION: '22'
+
+jobs:
+  build:
+    name: Build & Test JSON-C WASM
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        config: [Release, Debug]
+        simd: [ON, OFF]
+      fail-fast: false
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          
+      - name: Setup Emscripten SDK
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: ${{ env.EMSCRIPTEN_VERSION }}
+          actions-cache-folder: 'emsdk-cache'
+          
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+          
+      - name: Install binaryen for optimization
+        run: |
+          sudo apt-get install -y binaryen
+          
+      - name: Build WASM module
+        run: |
+          chmod +x build-wasm.sh
+          ./build-wasm.sh ${{ matrix.config }} ${{ matrix.simd }}
+          
+      - name: Validate build outputs
+        run: |
+          echo "Checking build artifacts..."
+          ls -la dist/
+          
+          # Check required files exist
+          files=("json-c.js" "json-c.wasm" "json-c.d.ts" "package.json" "README.md")
+          for file in "${files[@]}"; do
+            if [ -f "dist/$file" ]; then
+              echo "✓ $file exists ($(du -h dist/$file | cut -f1))"
+            else
+              echo "✗ $file missing"
+              exit 1
+            fi
+          done
+          
+          # Check SIMD build if enabled
+          if [ "${{ matrix.simd }}" = "ON" ] && [ -f "dist/json-c-simd.js" ]; then
+            echo "✓ SIMD build found ($(du -h dist/json-c-simd.js | cut -f1))"
+          fi
+          
+      - name: Install Node.js test dependencies
+        run: |
+          echo '{"type": "module"}' > package.json
+          
+      - name: Run integration tests
+        run: |
+          echo "Running WASM integration tests..."
+          node tests/wasm_integration_test.js
+          
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: json-c-wasm-${{ matrix.config }}-simd-${{ matrix.simd }}
+          path: dist/
+          retention-days: 30
+
+  performance:
+    name: Performance Benchmarks
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/wasm'
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: json-c-wasm-Release-simd-ON
+          path: dist/
+          
+      - name: Run performance benchmarks
+        run: |
+          echo '{"type": "module"}' > package.json
+          echo "## 📊 JSON-C.wasm Performance Benchmarks" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Create benchmark script
+          cat > benchmark.js << 'EOF'
+          import { promises as fs } from 'fs';
+          
+          const testCases = {
+            simple: '{"name": "test", "value": 42}',
+            nested: '{"users": [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}]}',
+            large: JSON.stringify({data: Array(100).fill({id: 1, name: "test"})})
+          };
+          
+          async function runBenchmarks() {
+            try {
+              const { default: JsonCModule } = await import('./dist/json-c.js');
+              const module = await JsonCModule();
+              const benchmark = module.cwrap('json_c_benchmark_parsing', 'number', ['string', 'number']);
+              
+              console.log("| Test Case | Iterations | Duration | Throughput |");
+              console.log("|-----------|------------|----------|------------|");
+              
+              Object.entries(testCases).forEach(([name, json]) => {
+                const iterations = name === 'large' ? 50 : 200;
+                const duration = benchmark(json, iterations);
+                const throughput = Math.round(iterations / (duration / 1000));
+                console.log(`| ${name} | ${iterations} | ${duration.toFixed(2)}ms | ${throughput} ops/sec |`);
+              });
+            } catch (err) {
+              console.log("Benchmark failed:", err.message);
+            }
+          }
+          
+          runBenchmarks();
+          EOF
+          
+          node benchmark.js >> $GITHUB_STEP_SUMMARY
+
+  quality:
+    name: Code Quality & Security  
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Check for security issues
+        run: |
+          echo "Checking for security issues in C code..."
+          if grep -r "gets\|strcpy\|sprintf\|password\|secret\|key" --exclude-dir=.git --exclude="*.md" --exclude="*.yml" --include="*.c" --include="*.h" .; then
+            echo "⚠️ Potential security issues found"
+          else
+            echo "✓ No obvious security issues detected"
+          fi
+          
+      - name: Validate build configuration
+        run: |
+          echo "Checking CMake configuration..."
+          if grep -q "ENABLE_THREADING=OFF" CMakeLists.txt; then
+            echo "✓ Threading disabled for WASM compatibility"
+          fi
+
+  release:
+    name: Release Package
+    needs: [build, performance, quality]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Setup Emscripten SDK
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: ${{ env.EMSCRIPTEN_VERSION }}
+          
+      - name: Build release package
+        run: |
+          chmod +x build-wasm.sh
+          ./build-wasm.sh Release ON
+          
+      - name: Create release archive
+        run: |
+          tar -czf json-c-wasm-${{ github.event.release.tag_name }}.tar.gz dist/ docs/ README.md
+          
+      - name: Upload release assets
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: json-c-wasm-${{ github.event.release.tag_name }}.tar.gz
+          asset_name: json-c-wasm-${{ github.event.release.tag_name }}.tar.gz
+          asset_content_type: application/gzip
